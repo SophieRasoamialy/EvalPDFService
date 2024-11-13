@@ -6,6 +6,7 @@ import re
 import unicodedata
 import string
 import math
+import json
 
 app = Flask(__name__)
 
@@ -124,23 +125,22 @@ def extract_text_and_annotations(pdf_path):
 
 def associate_responses_with_questions(grouped_questions, annotations):
     question_response_mapping = []
-    question_rect_final = None
 
     for page_num, annotation_list in annotations.items():
         for annotation in annotation_list:
-            question_rect_final = None
             # Vérifier que l'annotation est bien un dictionnaire
             if not isinstance(annotation, dict):
                 print(f"Unexpected type for annotation: {type(annotation)} - {annotation}")
-                continue  # Sauter cet élément s'il n'est pas un dictionnaire
+                continue
 
             annotation_rect = annotation.get('rect')
             if not isinstance(annotation_rect, fitz.Rect):
                 print(f"Unexpected type for annotation rect: {type(annotation.get('rect'))}")
                 continue
 
-            response_text = annotation.get('text_above', '').strip()  # Le texte au-dessus de l'annotation
+            response_text = annotation.get('text_above', '').strip()
             found_question = None
+            question_rect_final = None  # Initialisation de question_rect_final
            
             # Gestion des annotations de type 'manual_check' (cases cochées)
             if annotation['type'] == 'manual_check':
@@ -148,10 +148,8 @@ def associate_responses_with_questions(grouped_questions, annotations):
                     for question in grouped_questions:
                         if question['type'] == 'multiple_choice':
                             question_rect = fitz.Rect(question['bbox'])
-                            # Vérifier si la question est proche de l'annotation (au-dessus ou à gauche)
-                            question_center = get_center(question_rect)
+                            # Vérifier si la question est proche de l'annotation
                             for option in question['options']:
-                                # Associer l'option cochée à la question si elle correspond
                                 if normalize_text(annotation['text']) in normalize_text(option):
                                     found_question = question
                                     question_rect_final = question_rect
@@ -163,12 +161,10 @@ def associate_responses_with_questions(grouped_questions, annotations):
             elif annotation['type'] == 'manual_line':
                 normalized_response_text = normalize_text(response_text)
                 if len(response_text) > 0:
-                    # Chercher d'abord une correspondance avec une question à choix multiples
+                    # Chercher une correspondance avec une question à choix multiples
                     for question in grouped_questions:
                         if question['type'] == 'multiple_choice':
                             question_rect = fitz.Rect(question['bbox'])
-                            # Vérifier si la question est proche de l'annotation (au-dessus ou à gauche)
-                            question_center = get_center(question_rect)
                             for option in question['options']:
                                 if normalized_response_text in normalize_text(option):
                                     found_question = question
@@ -177,53 +173,43 @@ def associate_responses_with_questions(grouped_questions, annotations):
                         if found_question:
                             break
 
-                    # Si aucune correspondance n'est trouvée dans une question multiple-choice,
-                    # chercher une question ouverte (open_ended) avec des critères géographiques
+                    # Si aucune correspondance n'est trouvée, chercher une question ouverte
                     if not found_question:
                         max_y = -float('inf')
                         annotation_rect = fitz.Rect(annotation['rect'])
                         annotation_center = get_center((annotation_rect.x0, annotation_rect.y0, annotation_rect.x1, annotation_rect.y1))
-                        max_distance=100
+                        max_distance = 100
                         min_distance = float('inf')
                         
                         for question in grouped_questions:
                             if question['type'] == 'open_ended' and question['page_num'] == annotation['page_num']:
                                 question_rect = fitz.Rect(question['bbox'])
-                                # Vérifier si la question est proche de l'annotation (au-dessus ou à gauche)
                                 question_center = get_center(question_rect)
-
-                                # Calculer la distance entre le centre de l'annotation et celui de la question
                                 distance = euclidean_distance(annotation_center, question_center)
 
-                                # Vérifier si la question est plus proche que la précédente trouvée
                                 if distance < min_distance and distance <= max_distance:
                                     min_distance = distance
                                     found_question = question
-                                    #print(f"Found question near annotation with distance: {found_question['question']}")
-
+                                    question_rect_final = question_rect
                                 elif question_rect.y1 < annotation_rect.y0:
                                     if question_rect.y1 > max_y:
                                         max_y = question_rect.y1
                                         found_question = question
                                         question_rect_final = question_rect
-                                        #print(f"Found question above annotation: {found_question['question']}")
             
-           
-            # Ajouter la correspondance question-réponse si une correspondance est trouvée
-            if found_question:
-                # Associer correctement la réponse avec l'annotation ou le texte coché
+            # Ajouter la correspondance question-réponse uniquement si une question et son rectangle sont trouvés
+            if found_question and question_rect_final:
                 question_response_mapping.append({
                     'question': found_question['question'],
                     'response': response_text if annotation['type'] != 'manual_check' else annotation['text'],
                     'page_num': page_num,
-                    'question_rect': rect_to_dict(question_rect_final)  # Convertir question_rect en dictionnaire
+                    'question_rect': rect_to_dict(question_rect_final)
                 })
             else:
-                # Message d'erreur pour déboguer les réponses non associées
                 print(f"No matching question found for annotation on page {page_num}: {annotation}")
 
     return question_response_mapping
-  
+ 
 def get_center(rect):
     """
     Calcule le centre d'un rectangle.
@@ -449,7 +435,7 @@ def compare_responses(annotated, correct_answers):
                     similarity = util.pytorch_cos_sim(user_encoded, correct_encoded).item()
 
                     # Si la similarité est élevée, on considère que la réponse est correcte
-                    is_correct = similarity > 0.8  # Vous pouvez ajuster le seuil
+                    is_correct = similarity > 0.7  # Vous pouvez ajuster le seuil
                     rect = annotated_data['question_rect']
                     
                     results.append({
@@ -478,9 +464,10 @@ def compare_responses(annotated, correct_answers):
 @app.route('/analyze_qcm', methods=['POST'])
 def analyze_qcm():
     try:
-        data = request.json
-        pdf_path = data.get('pdf_path')
-        correct_answers = data.get('correct_answers')
+        pdf_file = request.files['pdf']
+        correct_answers = json.loads(request.form.get('correct_answers'))
+        pdf_path = "/tmp/tempfile.pdf"
+        pdf_file.save(pdf_path)
 
         if not pdf_path or not correct_answers:
             return jsonify({'error': 'Missing pdf_path or correct_answers'}), 400
@@ -490,15 +477,20 @@ def analyze_qcm():
 
         # Extraire le texte et les annotations du PDF
         student_info, grouped_questions = extract_text_and_annotations(pdf_path)
-
+        print("grouped questions>>>>>>", grouped_questions)
+        print("")
         # Ouvrir le document PDF
         doc = fitz.open(pdf_path)
 
         # Extraire les annotations spécifiques des réponses des étudiants
         page_annotations = extract_annotations(doc)
+        print("page annotations >>>>>>>", page_annotations)
+        print("")
 
         # Associer les annotations des réponses aux questions
         associated_responses = associate_responses_with_questions(grouped_questions, page_annotations)
+        print("associated_responses>>>>>>>>>", associated_responses)
+        print("")
 
         # Comparer les réponses annotées avec les réponses correctes
         comparison_results = compare_responses(associated_responses, cleaned_correct_answers)
